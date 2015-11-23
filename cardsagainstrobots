@@ -1,0 +1,970 @@
+#!/usr/bin/perl
+use 5.14.0;
+use warnings;
+
+#TODO: nick change
+
+my $server = "irc.soton.smoothwall.net";
+my $port = 6667;
+my $channel = "#cah";
+my $identity = "cahbot";
+
+use AnyEvent;
+use AnyEvent::IRC::Client;
+use List::Util qw( shuffle );
+
+my ($type, %data); # last event
+
+my @white_deck;
+my @white_discard;
+my $black_card;
+my @black_deck;
+my @black_discard;
+
+my %active = (
+	# Harry => 1,
+);
+my %hands = (
+	# Harry => [
+		# "your mother",
+		# "a man's distended anus",
+	# ], ...
+);
+my @random = (
+	# Harry,
+);
+my %chosen = (
+	# Harry => [5, 2],
+);
+my %scores = (
+	# Harry => { played => 23, judged => 2, points => 6 },
+);
+
+my $judge;
+my $winner;
+my $pick_n;
+
+my $state;
+
+sub main_loop
+{
+	LOOP: while (1) {
+		if ($state eq "begin") {
+			$state = "start_elect"; next LOOP;
+		}
+		elsif ($state eq "start_elect") {
+			announce("Who wants to be judge? Say 'me'.");
+			if (defined $winner) {
+				announce("$winner won last time, so it's their turn.");
+			}
+			$state = "elect"; next LOOP;
+		}
+		elsif ($state eq "elect") {
+			get();
+			if ($type eq "msg" and $data{text} =~ /\A (?i)Me \z/xms) {
+				if (scalar keys %active < 3) {
+					announce("Not enough players yet.");
+					next LOOP;
+				}
+
+				$judge = $data{user};
+				announce("OK, $judge is judge.");
+				$state = "deal"; next LOOP;
+			}
+			if ($type eq "join") {
+				# this will spam when we first join
+				# announce("$data{user}, no one is judge yet. Say 'me' to become judge.");
+				next LOOP;
+			}
+			if ($type eq "leave") {
+				next LOOP;
+			}
+			next LOOP;
+		}
+		elsif ($state eq "deal") {
+			choose_black_card();
+			announce(render_black_card());
+			foreach my $player (keys %active) {
+				next if $player eq $judge;
+				fill_player_hand($player);
+				list_player_hand($player);
+			}
+			%chosen = ();
+
+			$state = "choose"; next LOOP;
+		}
+		elsif ($state eq "choose") {
+			get();
+			if ($type eq "join") {
+				announce("$data{user}, just in time to play this round.");
+				fill_player_hand($data{user});
+				list_player_hand($data{user});
+			}
+			elsif ($type eq "leave" && $data{user} eq $judge) {
+				# leave should probably cleanup hands by itself
+				announce("Better start again");
+				$judge = undef;
+				$state = "start_elect"; next LOOP;
+			}
+			elsif ($type eq "pm" && $data{user} ne $judge) {
+				if (parse_choice($data{user}, $data{text})) {
+					announce((scalar keys %chosen) . "/" . ((scalar keys %active)-1) . " players chosen");
+					announce("Judge can say 'go'");
+				}
+			}
+			elsif ($type eq "msg" && $data{user} eq $judge
+					&& $data{text} =~ /\A (?i) Go \z/xms) {
+				announce("Judge is picking the winner");
+				$state = "offer"; next LOOP;
+			}
+		}
+		elsif ($state eq "offer") {
+			@random = List::Util::shuffle keys %chosen;
+			say_to($judge, "Your choices are:");
+			foreach my $idx (0..$#random) {
+				say_to($judge, "$idx: " . render_choice($random[$idx]));
+			}
+			$state = "pick"; next LOOP;
+		}
+		elsif ($state eq "pick") {
+			get();
+			if ($type eq "join") {
+				announce("$data{user}, too late. Play next round.");
+				next LOOP;
+			}
+			if ($type eq "leave" && $data{user} eq $judge) {
+				announce("Better start again");
+				$judge = undef;
+				$state = "start_elect"; next LOOP;
+			}
+			if ($type eq "pm" && $data{user} eq $judge) {
+				if (parse_pick($data{text})) {
+					$state = "score"; next LOOP;
+				}
+			}
+		}
+		elsif ($state eq "score") {
+			announce("The runners up are:");
+			foreach my $player (List::Util::shuffle keys %chosen) {
+				next if $player eq $winner;
+				announce(render_choice($player));
+			}
+			announce("But the winner is $winner:");
+			announce(render_choice($winner));
+			$scores{$judge}->{judged}++;
+			$scores{$winner}->{points}++;
+			foreach my $player (sort +($judge, keys %chosen)) {
+				$scores{$player}->{points} //= 0;
+				$scores{$player}->{played}++;
+				announce("$player has $scores{$player}->{points} points");
+				discard_chosen($player);
+			}
+			push(@black_discard, $black_card);
+			$state = "start_elect"; next LOOP;
+		}
+		next LOOP;
+	}
+};
+
+# Game API
+sub new_player
+{
+	my ($player) = @_;
+	$hands{$player} //= [];
+	$scores{$player} //= { played => 0, judged => 0, points => 0 };
+}
+sub draw_white_card
+{
+	if (!@white_deck) {
+		if (!@white_discard) {
+			die "Ran out of white cards";
+		}
+		@white_deck = shuffle @white_discard;
+	}
+	return shift @white_deck;
+}
+sub fill_player_hand
+{
+	my ($player) = @_;
+	# Make sure $player has a hand of 10
+
+	$hands{$player} = [	sort +(
+		@{ $hands{$player} // [] },
+		map { draw_white_card } (scalar(@{ $hands{$player} // [] }))..9
+	) ];
+}
+sub list_player_hand
+{
+	my ($player) = @_;
+	# PM $player their hand contents
+
+	say_to($player, render_black_card());
+	say_to($player, "Your cards are: ");
+	for (0..$#{ $hands{$player} }) {
+		say_to($player, "$_: " . ucfirst $hands{$player}->[$_]);
+	}
+	say_to($player, "State your choice privately");
+}
+sub parse_choice
+{
+	# $player said $text, is that a choice? Return true or false and update model.
+	my ($player, $text) = @_;
+	my $num = qr/ [1-9]* [0-9] /xms;
+	return if $text !~ /\A $num (?: ,$num )* \z/xms;
+	my @choices = split(/,/xms, $text);
+	my %unique = map { +($_ => 1) } @choices;
+	return if scalar(keys %unique) != $pick_n;
+	return if grep { $_ > $#{ $hands{$player} } } @choices;
+	$chosen{$player} = \@choices;
+	return 1;
+}
+sub render_choice
+{
+	# Interpolate the card chosen by $player.
+	my ($player) = @_;
+	return interpolate_blanks($black_card,
+		map { $hands{$player}->[$_] }
+		@{ $chosen{$player} });
+}
+sub render_black_card
+{
+	return interpolate_blanks($black_card, (("BLANK") x $pick_n))
+		. ($pick_n > 1 ? " Pick $pick_n" : "");
+}
+sub parse_pick
+{
+	# Judge said $text, is that a pick? Return true or false and update winner and model.
+	my ($text) = @_;
+	my $num = qr/ [1-9]* [0-9] /xms;
+	return if $text !~ /\A $num \z/xms;
+	return if $text > $#random;
+	$winner = $random[$text];
+	return 1;
+}
+sub choose_black_card
+{
+	if (!@black_deck) {
+		@black_deck = shuffle @black_discard;
+	}
+	$black_card = shift @black_deck;
+	$pick_n = count_blanks($black_card);
+}
+sub discard_chosen
+{
+	my ($player) = @_;
+	# Throw away the cards $player chose last round
+	foreach my $choice (@{ $chosen{$player} }) {
+		$hands{$player}->[$choice] = undef;
+	};
+	$hands{$player} = [ grep { defined $_ } @{ $hands{$player} } ];
+}
+
+sub load
+{
+	while (my $line = <DATA>) {
+		chomp $line;
+		last if ($line eq "");
+		push(@white_discard, $line);
+	};
+	while (my $line = <DATA>) {
+		chomp $line;
+		push(@black_discard, $line);
+	};
+}
+
+sub count_blanks
+{
+	my ($card) = @_;
+	if ($card =~ /\A \[ (\d+) \]/xms) {
+		return $1;
+	}
+	if ($card !~ / \^? _ /xms) {
+		return 1;
+	}
+	my @matches = ($card =~ / \^? _ /xmsg);
+	return scalar(@matches);
+}
+sub interpolate_one
+{
+	my ($card, $before, $after) = @_;
+	if ($before eq '^') {
+		$card = ucfirst $card;
+	}
+	if ($card =~ /[.!?]\z/xms) {
+		$after = "";
+	}
+	return $card . $after;
+}
+sub interpolate_blanks
+{
+	my ($black, @cards) = @_;
+	if ($black =~ /\A \[ \d+ \] (.*)/xms) {
+		return $1 . " " . join(" / ", map { ucfirst } @cards);
+	}
+	if ($black !~ / \^? _ /xms) {
+		$black .= " ^_.";
+	}
+	return scalar (
+		$black =~ s/ (\^?) _ ([.!]?)
+			/interpolate_one(shift(@cards), $1, $2)/xmsger
+	);
+}
+
+# Event handling routines
+my @queue = ();
+my $event = AnyEvent->condvar;
+
+sub got
+{
+	say STDERR join("", "event: [", join(",", @_), "]");
+	push(@queue, \@_);
+	$event->send;
+	$event = AnyEvent->condvar;
+}
+my $io = AnyEvent->io(fh => \*STDIN, poll => "r", cb => sub {
+	my $line = <STDIN>;
+	chomp $line;
+	my ($type, $user, $text) = split(/[ ]/xms, $line, 3);
+
+	if ($type eq 'pm') {
+		return unless $active{$user};
+		got("pm", user => $user, text => $text);
+	}
+	elsif ($type eq 'msg') {
+		return unless $active{$user};
+		got("msg", user => $user, text => $text);
+	}
+	elsif ($type eq 'join') {
+		$active{$user} = 1;
+		got("join", user => $user);
+	}
+	elsif ($type eq 'leave') {
+		delete $active{$user};
+		got("leave", user => $user);
+	}
+	elsif ($type eq 'quit') {
+		got("quit");
+	}
+	else {
+		say "say what?";
+	}
+});
+
+sub get
+{
+	while (!@queue) {
+		my $current = $event;
+		$current->recv;
+	}
+	($type, %data) = @{ shift @queue };
+}
+
+# IRC routines
+
+my $client = AnyEvent::IRC::Client->new();
+$client->reg_cb(disconnect => sub { got("quit"); });
+$client->reg_cb(registered => sub { $client->enable_ping(60); });
+$client->reg_cb(channel_add => sub {
+	my (undef, undef, $channel, @nicks) = @_;
+	foreach my $nick (@nicks) {
+		next if $client->is_my_nick($nick);
+		$active{$nick} = 1;
+		got("join", user => $nick);
+	}
+});
+$client->reg_cb(channel_remove => sub {
+	my (undef, undef, $channel, @nicks) = @_;
+	foreach my $nick (@nicks) {
+		next if $client->is_my_nick($nick);
+		delete $active{$nick};
+		got("leave", user => $nick);
+	}
+});
+$client->reg_cb(irc_privmsg => sub {
+	my (undef, $msg) = @_;
+	my ($user) = ($msg->{prefix} =~ /^ ([^!]+) !/xms);
+	my ($to, $text) = @{ $msg->{params} };
+	return if !defined $user;
+	return if !defined $to;
+	return if !defined $text;
+	if ($to =~ /^ \# /xms) {
+		got("msg", user => $user, text => $text);
+	}
+	else {
+		got("pm", user => $user, text => $text);
+	}
+});
+
+sub say_to
+{
+	my ($user, $message) = @_;
+	say "($user: $message)";
+	$client->send_srv("PRIVMSG", $user, $message);
+}
+sub announce
+{
+	my ($message) = @_;
+	say $message;
+	$client->send_srv("PRIVMSG", $channel, $message);
+}
+
+$client->send_srv("JOIN", $channel);
+$client->connect($server, $port, { map { $_ => $identity } qw(nick user real) });
+
+srand;
+$state = "begin";
+load();
+main_loop();
+
+__DATA__
+being on fire
+racism
+old-people smell
+a micropenis
+used knickers
+classist undertones
+not giving a shit about the Third World
+a man on the brink of orgasm
+the bloody Welsh
+a windmill full of corpses
+the gays
+an oversized lollipop
+African children
+an asymmetric boob job
+a Super Soaker full of cat piss
+blowing up Parliament
+an Oedipus complex
+a tiny horse
+a Chelsea smile
+penis envy
+Barack Obama
+my humps
+waking up half-naked in a Little Chef car park
+Scientology
+dry heaving
+badger culling
+Darth Vader
+the sudden appearance of the Go Compare man
+women in yoghurt adverts
+seeing Granny naked
+elderly Japanese men
+free samples
+estrogen
+sexual tension
+famine
+a stray pube
+men
+heartwarming orphans
+genuine human connection
+a bag of magic beans
+repression
+prancing
+my relationship status
+overcompensation
+peeing a little bit
+pooping back and forth. Forever
+a ginger's freckled ballsack
+testicular torsion
+the Devil himself
+the World of Warcraft
+some bloody peace and quiet
+MechaHitler
+being fabulous
+pictures of boobs
+a gentle caress of the inner thigh
+wiping her bum
+doing a shit in Pudsey Bear's eyehole
+Lance Armstrong's missing testicle
+England
+the Pope
+flying sex snakes
+Emma Watson
+my ex-wife
+sexy pillow fights
+a Fleshlight
+cybernetic enhancements
+civilian casualties
+magnets
+the female orgasm
+bitches
+Madeleine McCann
+Auschwitz
+finger painting
+a sober Irishman who doesn't care for potatoes
+the Jews
+being marginalized
+the Blood of Christ
+dead parents
+the art of seduction
+dying of dysentery
+an entrenched class system
+the North
+rubbing Boris Johnson's belly until he falls asleep
+the Hillsborough Disaster
+Natalie Portman
+agriculture
+ripping off the Beatles
+surprise sex!
+the homosexual agenda
+bio-engineered assault turtles with acid breath
+the end of days
+an M. Night Shyamalan plot twist
+funky fresh rhymes
+the light of a billion suns
+amputees
+throwing a virgin into a volcano
+Italians
+explosions
+a good sniff
+destroying the evidence
+children on leashes
+catapults
+one trillion dollars
+establishing dominance
+dying
+silence
+growing a pair
+YOU MUST CONSTRUCT ADDITIONAL PYLONS
+Justin Bieber
+the Holy Bible
+balls
+praying the gay away
+teenage pregnancy
+German dungeon porn
+Jedward
+my inner demons
+powerful thighs
+a bleached arsehole
+crippling debt
+kamikaze pilots
+teaching a robot to love
+police brutality
+horse meat
+a madman who lives in a police box and kidnaps women
+the Scouts
+Michael Jackson
+a really cool hat
+copping a feel
+crystal meth
+shapeshifters
+fingering
+a disappointing birthday party
+getting naked and watching CBeebies
+my soul
+the unstoppable tide of Islam
+Ed Balls
+eugenics
+synergistic management solutions
+RoboCop
+serfdom
+Stephen Hawking talking dirt
+saying "I love you"
+Millwall fans
+public ridicule
+holding down a child and farting all over him
+penis breath
+object permanence
+chivalry
+lockjaw
+the cool, refreshing taste of Pepsi
+Daniel Radcliffe's delicious arsehole
+wet dreams
+crumbs all over the bloody carpet
+firing a rifle into the air while balls deep in a squealing hog
+panda sex
+necrophilia
+grave robbing
+not wearing trousers
+Muhammad (Praise Be Unto Him)
+multiple stab wounds
+a ball of earwax, semen, and toenail clippings
+a monkey smoking a cigar
+smegma
+a live studio audience
+making a pouty face
+the violation of our most basic human rights
+unfathomable stupidity
+sunshine and rainbows
+whipping it out
+the token minority
+the terrorists
+cheating in the Paralympics
+a snapping turtle biting the tip of your penis
+the Honey Monster
+the Great Depression
+emotions
+getting so angry that you pop a boner
+same-sex ice dancing
+anything that comes out of Prince Philip's mouth
+man meat
+incest
+David Bowie flying in on a tiger made of lightning
+flightless birds
+doing the right thing
+when you fart and a little bit comes out
+frolicking
+being a dick to children
+Queen Elizabeth's immaculate anus
+the Black Death
+raptor attacks
+swooping
+perfunctory foreplay
+full frontal nudity
+vigorous jazz hands
+nipple blades
+a bitch slap
+a mad cow
+mouth herpes
+a robust mongoloid
+mutually-assured destruction
+a fanny fart
+The Stig
+Stalin
+lactation
+wanking into a pool of children's tears
+the true meaning of Christmas
+self-loathing
+a brain tumor
+dead babies
+New Age music
+a thermonuclear detonation
+geese
+a posh wank
+God
+a spastic nerd
+Harry Potter erotica
+kids with bum cancer
+lumberjack fantasies
+the American Dream
+puberty
+sweet, sweet vengeance
+winking at old people
+haggis
+Oompa-Loompas
+being hunted like a fox
+preteens
+Jade Goody's cancerous remains
+having anuses for eyes
+erectile dysfunction
+inserting a Mason jar into my anus
+cheeky bum sex
+a saxophone solo
+land mines
+Jehovah's Witnesses
+me time
+Nickelback
+vigilante justice
+leaked footage of Kate Middleton's colonoscopy
+opposable thumbs
+ghosts
+alcoholism
+poorly-timed Holocaust jokes
+inappropriate yodeling
+battlefield amputations
+exactly what you'd expect
+a time travel paradox
+a foul mouth
+running out of semen
+an endless stream of diarrhoea
+a sassy black woman
+being a motherfucking sorcerer
+a mopey zoo lion
+a murder most foul
+a falcon with a cap on its head
+farting and walking away
+a mating display
+the Chinese gymnastics team
+friction
+the petty troubles of the landed gentry
+fear itself
+Scousers
+yeast
+Maureen of Blackpool, Reader's Wife of the Year 1988
+licking things to claim them as your own
+Vikings
+bogies
+hot cheese
+Nicolas Cage
+a defective condom
+the inevitable heat death of the universe
+blood, toil, tears, and sweat
+William Shatner
+tentacle porn
+sperm whales
+Lady Gaga
+chunks of dead hitchhiker
+gloryholes
+daddy issues
+a mime having a stroke
+white people
+a lifetime of sadness
+tasteful sideboob
+a sea of troubles
+Nazis
+a cooler full of organs
+giving 110%
+scalping the Milkybar Kid
+concealing an erection
+the morbidly obese
+a homoerotic volleyball montage
+puppies!
+natural male enhancement
+brown people
+dropping a chandelier on your enemies and riding the rope up
+soup that is too hot
+three dicks at the same time
+hormone injections
+pulling out
+the Big Bang
+an AK-47 assault rifle
+the wrath of Vladimir Putin
+court-ordered rehab
+Christopher Walken
+giving birth to the Antichrist
+a foetus
+not reciprocating oral sex
+ecstasy
+hot people
+foreskin
+the BNP
+the miracle of childbirth
+waiting 'til marriage
+two midgets shitting into a bucket
+David Cameron
+a sad handjob
+just touching David Beckham's hair
+the glass ceiling
+extremely tight trousers
+your weird brother
+hip hop jewels
+breaking out into song and dance
+druids
+trench foot
+an argument with Richard Dawkins
+the Rev. Dr. Martin Luther King, Jr.
+the French
+dirty nappies
+Germans on holiday
+sexual peeing
+white privilege
+hope
+taking off your shirt
+One Direction's supple, hairless bodies
+ethnic cleansing
+paedophiles
+Daddies Brown Sauce
+getting really high
+natural selection
+a gassy antelope
+my sex life
+Arnold Schwarzenegger
+pretending to care
+pronouncing the names of northern Welsh towns
+getting wed, having a few kids, taking some pictures, retiring to the south of France, and dying
+an ugly face
+sex with Patrick Stewart
+BATMAN!!!
+homeless people
+Spaniards
+centaurs
+a salty surprise
+72 virgins
+embryonic stem cells
+pixelated bukkake
+seppuku
+an icepick lobotomy
+dark and mysterious forces beyond our control
+menstrual rage
+the rhythms of Africa
+invading Poland
+Gentleman's Relish
+horrifying laser hair removal accidents
+autocannibalism
+slapping a biscuit out of an orphan's mouth
+riding off into the sunset
+goblins
+Excalibur
+shiny objects
+being rich
+Gary Glitter
+leprosy
+world peace
+dick fingers
+chainsaws for hands
+a white van man
+Miley Cyrus at 55
+laying an egg
+the folly of man
+my genitals
+grandma
+flesh-eating bacteria
+poor people
+50,000 volts straight to the nipples
+hurling one's body down a hill in pursuit of a wheel of cheese
+strong female characters
+poor life choices
+altar boys
+my vagina
+Pac-Man uncontrollably guzzling cum
+sniffing glue
+the placenta
+the profoundly handicapped
+spontaneous human combustion
+the KKK
+the clitoris
+shitting out a perfect Cumberland sausage
+consensual sex
+black people
+a bucket of fish heads
+hospice care
+passive-aggressive Post-It notes
+the entire cast of Downton Abbey
+the heart of a child
+the pirate's life
+cottaging
+being fat and stupid
+five litres of Special Brew
+Sean Penn
+Sean Connery
+expecting a burp and vomiting ont he floor
+wifely duties
+a pyramid of severed heads
+Genghis Khan
+a vindaloo poo
+crucifixion
+a subscription to Men's Fitness
+the milk man
+friendly fire
+women's suffrage
+AIDS
+a bit of slap and tickle
+8 oz. of sweet Mexican black-tar heroin
+a thousand Scottish warriors lifting their kilts in unison
+edible underwear
+my collection of high-tech sex toys
+the Force
+bees?
+Buckfast Tonic Wine
+Tories
+a micropig wearing a tiny raincoat and booties
+jobs
+masturbation
+Tom Cruise
+a balanced breakfast
+anal beads
+drinking alone
+Cards Against Humanity
+coat hanger abortions
+400 years of colonial atrocities
+cuddling
+faffing about
+a nice cup of tea
+mining accidents
+Morgan Freeman's voice
+a middle-aged man on roller skates
+Gandhi
+Jimmy Savile
+spectacular abs
+Keanu Reeves
+child beauty pageants
+child abuse
+LYNX Body Spray
+science
+a tribe of warrior women
+Viagra
+Her Majesty, Queen Elizabeth II
+the way James Bond treats women
+dogging
+take-backsies
+an erection that lasts longer than four hours
+
+How did I lose my virginity?
+Why can't I sleep at night?
+What's that smell?
+I got 99 problems but _ ain't one.
+Maybe she's born with it. Maybe it's _.
+What's the next Happy Meal toy?
+Here is the church / Here is the steeple / Open the doors / And there is _.
+It's a pity that kids these days are all getting involved with _.
+I get by with a little help from _.
+Alternative medicine is now embracing the curative powers of _.
+They said we were crazy. They said we couldn't put _ inside of _. They were wrong.
+What's that sound?
+What ended my last relationship?
+The Natural History Museum has just opened an interactive exhibit on _.
+I drink to forget _.
+Dear Agony Aunt, I'm having some trouble with _ and would like your advice.
+What is Batman's guilty pleasure?
+This is the way the world ends / This is the way the world ends / Not with a bang but with _.
+What's a girl's best friend?
+Daddy, why is mummy crying?
+^_. That's how I want to die.
+For my next trick, I will pull _ out of _.
+I'm sorry, Sir, but I couldn't do my homework because of _.
+^_ is a slippery slope that leads to _.
+The theme for next year's Eurovision Song Contest is "We are _".
+Nobody expects the Spanish Inquisiton. Our chief weapons are fear, surprise, and _.
+In Wormwood Scrubs, word is you can trade 200 cigarettes for _.
+What's the most emo?
+In 1,000 years, when paper money is a distant memory, how will we pay for goods and services?
+Introducing the amazing superhero/sidekick duo! It's _ and _!
+In M. Night Shyamalan's new movie, Bruce Willis discovers that _ had really been _ all along.
+A romantic, candlelit dinner would be incomplete without _.
+^_? Jim'll fix it!
+White people like _.
+When I am Prime Minister of the United Kingdom, I will create the Ministry of ^_.
+Next from J. K. Rowling: Harry Potter and the Chamber of ^_.
+What kept Margaret Thatcher busy in her waning years?
+In a world ravaged by _, our only solace is _.
+War! / What is it good for?
+During sex, I like to think about _.
+What are my parents hiding from me?
+What will always get you laid?
+In her latest feature-length film, Tracy Beaker struggles with _ for the first time.
+Airport security guidelines now prohibit _ on airplanes.
+What don't you want to find in your Kung Pao chicken?
+What will I bring back in time to convince people that I am a powerful wizard?
+How am I maintaining my relationship status?
+^_. It's a trap!
+The school trip was completely ruined by _.
+What did I bring back from Amsterdam?
+After the earthquake, Sean Penn brought _ to the people of Haiti.
+TFL apologizes for the delay in train service due to _.
+Step 1: ^_. Step 2: ^_. Step 3: Profit.
+And the BAFTA for _ goes to _.
+But before I kill you, Mr. Bond, I must show you _.
+What gives me uncontrollable gas?
+Today on the Jeremy Kyle Show: "Help! My son is _!"
+Next on Sky Sports: The World Championship of _.
+When Pharaoh remained unmoved, Moses called down a plague of _.
+What's my secret power?
+What's there a ton of in heaven?
+What would grandma find disturbing, yet oddly charming?
+I never truly understood _ until I encountered _.
+What did the U.S. airdrop to the children of Afghanistan?
+What helps Obama unwind?
+What did Vin Diesel eat for dinner?
+^_: good to the last drop.
+Why am I sticky?
+What gets better with age?
+^_: kid-tested, mother-approved.
+Channel 5's new reality show features eight washed-up celebrities living with _.
+Instead of coal, Father Christmas now gives the bad children _.
+A recent laboratory study shows that undergraduates have 50% less sex after being exposed to _.
+Life for American Indians was forever changed when the White Man introduced them to _.
+[3]Make a haiku.
+I do not know with what weapons World War III will be fought, but World War IV will be fought with _.
+Why do I hurt all over?
+What am I giving up for Lent?
+Fun tip! When your man asks you to go down on him, try surprising him with _ instead.
+Coming to the West End this year, ^_: The Musical.
+^_: Once you pop, the fun don't stop!
+Channel 4 presents "^_, the story of _."
+When I am a billionaire, I shall erect a 50-foot statue to commemorate _.
+When I was tripping on acid, _ turned into _.
+That's right, I killed _. How, you ask? ^_.
+What are school administrators using to curb rampant teenage pregnancy?
+^_ + ^_ = ^_.
+What never fails to liven up the party?
+What's the new fad diet?
+^_. That's why mums go to Iceland.
