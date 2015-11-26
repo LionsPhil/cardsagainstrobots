@@ -8,6 +8,7 @@ my $server = "irc.soton.smoothwall.net";
 my $port = 6667;
 my $channel = "#cah";
 my $identity = "cahbot";
+my $min_players = 3;
 
 use AnyEvent;
 use AnyEvent::IRC::Client;
@@ -21,6 +22,9 @@ my $black_card;
 my @black_deck;
 my @black_discard;
 
+my %joined = (
+	# Harry => 1,
+);
 my %active = (
 	# Harry => 1,
 );
@@ -50,34 +54,45 @@ sub main_loop
 {
 	LOOP: while (1) {
 		if ($state eq "begin") {
-			$state = "start_elect"; next LOOP;
+			announce("I'm a Cards Against Humanity bot!");
+			announce("PM me if you want to play.");
+			$state = "players"; next LOOP;
+		}
+		elsif ($state eq "players") {
+			if (scalar keys %active >= $min_players) {
+				$state = "start_elect"; next LOOP;
+			}
+
+			get();
+			if ($type eq "pm") {
+				$active{$data{user}} = 1;
+				say_to($data{user}, "OK, you can play next round.");
+			}
 		}
 		elsif ($state eq "start_elect") {
+			undef $judge;
+
 			announce("Who wants to be judge? Say 'me'.");
-			if (defined $winner) {
+			if (defined $winner && $active{$winner}) {
 				announce("$winner won last time, so it's their turn.");
 			}
 			$state = "elect"; next LOOP;
 		}
 		elsif ($state eq "elect") {
+			if (scalar keys %active < $min_players) {
+				announce("$min_players needed :(");
+				$state = "begin"; next LOOP;
+			}
+
 			get();
 			if ($type eq "msg" and $data{text} =~ /\A (?i)Me \z/xms) {
-				if (scalar keys %active < 3) {
-					announce("Not enough players yet.");
-					next LOOP;
-				}
-
 				$judge = $data{user};
 				announce("OK, $judge is judge.");
 				$state = "deal"; next LOOP;
 			}
-			if ($type eq "join") {
-				# this will spam when we first join
-				# announce("$data{user}, no one is judge yet. Say 'me' to become judge.");
-				next LOOP;
-			}
-			if ($type eq "leave") {
-				next LOOP;
+			if ($type eq "pm") {
+				$active{$data{user}} = 1;
+				say_to($data{user}, "OK, you can play this round.");
 			}
 			next LOOP;
 		}
@@ -94,31 +109,53 @@ sub main_loop
 			$state = "choose"; next LOOP;
 		}
 		elsif ($state eq "choose") {
-			get();
-			if ($type eq "join") {
-				announce("$data{user}, just in time to play this round.");
-				fill_player_hand($data{user});
-				list_player_hand($data{user});
+			if (scalar keys %active < $min_players) {
+				announce("$min_players needed :(");
+				$state = "begin"; next LOOP;
 			}
-			elsif ($type eq "leave" && $data{user} eq $judge) {
-				# leave should probably cleanup hands by itself
-				announce("Better start again");
-				$judge = undef;
+
+			get();
+			if ($type eq "leave" && $data{user} eq $judge) {
+				announce("The judge left. Better choose another.");
 				$state = "start_elect"; next LOOP;
 			}
 			elsif ($type eq "pm" && $data{user} ne $judge) {
-				if (parse_choice($data{user}, $data{text})) {
-					announce((scalar keys %chosen) . "/" . ((scalar keys %active)-1) . " players chosen");
+				if (!$active{$data{user}}) {
+					$active{$data{user}} = 1;
+					say_to($data{user}, "OK, just in time to play this round.");
+					fill_player_hand($data{user});
+					list_player_hand($data{user});
+				}
+				elsif (!defined $chosen{$data{user}}
+					&& parse_choice($data{user}, $data{text})) {
+
+					announce("Waiting for "
+						. join(", ", sort grep { $_ ne $judge && !defined $chosen{$_} } keys %active));
+				}
+				if (scalar keys %chosen >= $min_players - 1) {
 					announce("Judge can say 'go'");
 				}
 			}
 			elsif ($type eq "msg" && $data{user} eq $judge
 					&& $data{text} =~ /\A (?i) Go \z/xms) {
-				announce("Judge is picking the winner");
-				$state = "offer"; next LOOP;
+				if (scalar keys %chosen >= $min_players - 1) {
+					announce("OK, $judge, pick the winner...");
+					$state = "offer"; next LOOP;
+				}
+				else {
+					announce("Not enough people have made a choice yet.");
+				}
 			}
 		}
 		elsif ($state eq "offer") {
+			foreach my $player (keys %active) {
+				next if $player eq $judge;
+				if (!defined $chosen{$player}) {
+					say_to($player, "Too late to play this round. PM me if you still want to play.");
+					$active{$player} = 0;
+				}
+			}
+
 			@random = List::Util::shuffle keys %chosen;
 			say_to($judge, "Your choices are:");
 			foreach my $idx (0..$#random) {
@@ -127,14 +164,19 @@ sub main_loop
 			$state = "pick"; next LOOP;
 		}
 		elsif ($state eq "pick") {
+			if (scalar keys %active < $min_players) {
+				announce("$min_players needed :(");
+				$state = "begin"; next LOOP;
+			}
+
 			get();
-			if ($type eq "join") {
-				announce("$data{user}, too late. Play next round.");
+			if ($type eq "pm" && !$active{$data{user}}) {
+				$active{$data{user}} = 1;
+				say_to($data{user}, "OK, you can play next round.");
 				next LOOP;
 			}
 			if ($type eq "leave" && $data{user} eq $judge) {
-				announce("Better start again");
-				$judge = undef;
+				announce("The judge left. Better choose another.");
 				$state = "start_elect"; next LOOP;
 			}
 			if ($type eq "pm" && $data{user} eq $judge) {
@@ -327,18 +369,19 @@ my $io = AnyEvent->io(fh => \*STDIN, poll => "r", cb => sub {
 	my ($type, $user, $text) = split(/[ ]/xms, $line, 3);
 
 	if ($type eq 'pm') {
-		return unless $active{$user};
+		return unless $joined{$user};
 		got("pm", user => $user, text => $text);
 	}
 	elsif ($type eq 'msg') {
-		return unless $active{$user};
+		return unless $joined{$user};
 		got("msg", user => $user, text => $text);
 	}
 	elsif ($type eq 'join') {
-		$active{$user} = 1;
+		$joined{$user} = 1;
 		got("join", user => $user);
 	}
 	elsif ($type eq 'leave') {
+		delete $joined{$user};
 		delete $active{$user};
 		got("leave", user => $user);
 	}
@@ -368,7 +411,7 @@ $client->reg_cb(channel_add => sub {
 	my (undef, undef, $channel, @nicks) = @_;
 	foreach my $nick (@nicks) {
 		next if $client->is_my_nick($nick);
-		$active{$nick} = 1;
+		$joined{$nick} = 1;
 		got("join", user => $nick);
 	}
 });
@@ -376,6 +419,7 @@ $client->reg_cb(channel_remove => sub {
 	my (undef, undef, $channel, @nicks) = @_;
 	foreach my $nick (@nicks) {
 		next if $client->is_my_nick($nick);
+		delete $joined{$nick};
 		delete $active{$nick};
 		got("leave", user => $nick);
 	}
@@ -387,6 +431,9 @@ $client->reg_cb(irc_privmsg => sub {
 	return if !defined $user;
 	return if !defined $to;
 	return if !defined $text;
+	if (!$joined{$user}) {
+		say_to($user, "Only members of $channel can play.");
+	}
 	if ($to =~ /^ \# /xms) {
 		got("msg", user => $user, text => $text);
 	}
