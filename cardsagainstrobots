@@ -2,6 +2,33 @@
 use 5.14.0;
 use warnings;
 
+# Game data copyright Cards Against Humanity, LLC.
+# The text of the cards is included at the end of this file.
+# This work is licensed under the Creative Commons
+# Attribution-NonCommercial-ShareAlike 2.0 License.
+# To view a copy of this license, visit
+# <http://creativecommons.org/licenses/by-nc-sa/2.0/>.
+#
+# Source code copyright 2015-2016 Harry Mason
+# Note that the data licence is more restrictive than the code licence.
+# Some of your rights under the GPL can only be applied if the game data
+# is removed.
+# I don't think the mechanics of a game are copyrightable, in which case
+# reimplementing the game under a different licence is legal. Therefore:
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 #TODO: nick change
 
 my $server = "irc.soton.smoothwall.net";
@@ -462,6 +489,23 @@ srand;
 $state = "begin";
 load();
 main_loop();
+
+# The remainder of this file is copyright Cards Against Humanity, LLC.
+#
+# Cards Against Humanity is available under a Creative Commons BY-NC-SA 2.0
+# license. That means you can use, remix, and share the game for free, but you
+# can’t sell it without our permission. Please do not steal our name or we will
+# smash you.
+#
+# From their FAQ:
+#
+# Cards Against Humanity is available under a BY-NC-SA 2.0 Creative Commons
+# license. That means you can use our content to make whatever, but you have to
+# give us credit, you can’t profit from the use of our content (this means ad
+# revenue is not allowed), and you have to share whatever you make in the same
+# way we share it (this means you can’t submit our content to any app store).
+# We own the name "Cards Against Humanity," so you have to call your crappy
+# thing something else.
 
 __DATA__
 being on fire
